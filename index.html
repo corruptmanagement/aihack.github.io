@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>VisionMate AI — Live Camera Assistant</title>
+<link rel="preload" as="script" href="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd" />
+<style>
+  body{margin:0;font-family:Arial,sans-serif;background:#0b1220;color:#e6eef6;display:flex;flex-direction:column;align-items:center;padding:16px}
+  h1{margin-bottom:12px}
+  video{border-radius:12px;margin-bottom:12px; transform: scaleX(-1); /* horizontal mirror */}
+  button{font-size:16px;padding:12px 20px;margin:6px;border-radius:8px;border:none;background:#1fb6ff;color:#022;cursor:pointer}
+  button:disabled{background:#555;color:#999;cursor:not-allowed}
+  #output{margin-top:12px;background:rgba(255,255,255,0.03);padding:12px;border-radius:8px;width:100%;max-width:480px;min-height:60px}
+  .error{color:#ff4d4f}
+</style>
+</head>
+<body>
+<h1>VisionMate AI — Live Camera Assistant</h1>
+<video id="camera" width="400" height="300" autoplay muted></video>
+<div>
+  <button id="describe-btn" disabled>🎥 Describe Scene (Loading Model...)</button>
+  <button id="read-text-btn">📄 Read Text</button>
+</div>
+<div id="output">Initializing AI Vision System...</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@v5.0.3/dist/tesseract.min.js"></script>
+<script>
+  const video = document.getElementById('camera');
+  const output = document.getElementById('output');
+  const describeBtn = document.getElementById('describe-btn');
+
+  let ocrWorker = null;
+  let ocrTimer = null;
+  const OCR_TIMEOUT = 2 * 60 * 1000; // 2 minutes inactivity
+
+  async function startCamera(){
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({video:true});
+      video.srcObject = stream;
+    } catch(err){
+      output.innerHTML = `<span class='error'>Camera access failed: ${err}.<br>Please run on HTTPS or localhost and allow camera permissions.</span>`;
+      console.error(err);
+    }
+  }
+  startCamera();
+
+  (async()=>{
+    try {
+      await tf.setBackend('webgl');
+      await tf.ready();
+      console.log('Using backend:', tf.getBackend());
+    } catch(err){
+      console.warn('WebGL backend setup failed, fallback to default:', err);
+    }
+  })();
+
+  let model;
+  (async()=>{
+    output.innerText = 'Loading object detection model...';
+    try {
+      model = await cocoSsd.load({base: 'lite_mobilenet_v2'});
+      output.innerText = 'Warming up model...';
+      await new Promise(resolve => {
+        if (video.readyState >= 2) resolve();
+        else video.onloadeddata = resolve;
+      });
+      await model.detect(video);
+      output.innerText = 'Model ready! You can now describe scenes.';
+      describeBtn.disabled = false;
+      describeBtn.innerText = '🎥 Describe Scene';
+      speak('VisionMate is ready.');
+    } catch(err){
+      output.innerHTML = `<span class='error'>Model failed to load: ${err}</span>`;
+      console.error(err);
+    }
+  })();
+
+  async function initOCRWorker(){
+    if(ocrWorker) return;
+    ocrWorker = await Tesseract.createWorker({
+      corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@v5.0.3',
+      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@v5.0.3/dist/worker.min.js',
+      langPath: 'https://tessdata.projectnaptha.com/4.0.0_fast',
+      logger: m => console.log(m)
+    });
+    await ocrWorker.load();
+    await ocrWorker.loadLanguage('eng');
+    await ocrWorker.initialize('eng');
+  }
+
+  function resetOCRTimer(){
+    if(ocrTimer) clearTimeout(ocrTimer);
+    ocrTimer = setTimeout(async ()=>{
+      if(ocrWorker){
+        await ocrWorker.terminate();
+        ocrWorker = null;
+        output.innerText = 'Text reader sleeping to save memory. Click Read Text to wake it up.';
+        console.log('OCR worker terminated due to inactivity.');
+      }
+    }, OCR_TIMEOUT);
+  }
+
+  document.getElementById('read-text-btn').addEventListener('click', async ()=>{
+    if(!video.srcObject){ output.innerHTML=`<span class='error'>Camera not connected. Please allow camera permissions or run on HTTPS/localhost.</span>`; return; }
+
+    await initOCRWorker();
+    resetOCRTimer();
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 480;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    for (let i = 0; i < imageData.data.length; i += 4) {
+      const avg = (imageData.data[i] + imageData.data[i+1] + imageData.data[i+2]) / 3;
+      const val = avg > 128 ? 255 : 0;
+      imageData.data[i] = imageData.data[i+1] = imageData.data[i+2] = val;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    const dataURL = canvas.toDataURL('image/png');
+
+    output.innerText = 'Reading text...';
+    const { data } = await ocrWorker.recognize(dataURL);
+    const text = data.text.trim() || 'No text detected';
+    output.innerText = text;
+    speak(text);
+  });
+
+  async function describeScene(){
+    if(!model){ output.innerText='Model not loaded yet.'; return; }
+    if(!video.srcObject){ output.innerHTML=`<span class='error'>Camera not connected. Please allow camera permissions or run on HTTPS/localhost.</span>`; return; }
+
+    const predictions = await model.detect(video);
+    if(predictions.length===0){
+      output.innerText = 'No objects detected.';
+      speak('I do not see any objects.');
+      return;
+    }
+
+    // Generalize classes and count instances
+    const counts = {};
+    predictions.forEach(p => {
+      counts[p.class] = (counts[p.class] || 0) + 1;
+    });
+
+    let descArr = [];
+    for(const cls in counts){
+      const num = counts[cls];
+      descArr.push(num === 1 ? `1 ${cls}` : `${num} ${cls}s`);
+    }
+    const desc = `I see ${descArr.join(', ')}`;
+
+    output.innerText = desc;
+    speak(desc);
+  }
+
+  describeBtn.addEventListener('click', describeScene);
+
+  function speak(text){
+    if(!('speechSynthesis' in window)) return;
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang='en-US'; utter.rate=1.0; utter.pitch=1.0;
+    window.speechSynthesis.cancel(); window.speechSynthesis.speak(utter);
+  }
+</script>
+</body>
+</html>
